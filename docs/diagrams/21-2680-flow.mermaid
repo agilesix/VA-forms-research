@@ -1,0 +1,27 @@
+sequenceDiagram
+  autonumber
+  participant U as User (Browser)
+  participant W as VA.gov (vets-website)
+  participant A as Simple Forms API (vets-api)
+  participant L as Lighthouse Benefits Intake (Central Mail)
+  participant S as S3 Archive
+
+  Note over U,S: Form 21-2680 Upload Flow
+
+  U->>W: Navigate to 21-2680 upload or pensions docs step
+  W->>A: POST /simple_forms_api/v1/uploads (formId=21-2680)
+  
+  Note over A: Validation & Processing
+  A->>A: Validate PDF extension and content
+  A->>A: Optionally fill/stamp PDF with UUID
+  
+  Note over A,L: Lighthouse Integration
+  A->>L: Request upload URL + metadata (GUID)
+  L-->>A: Upload location (pre-signed) + tracking GUID
+  A->>L: Upload PDF + metadata (document type for 21-2680)
+  L-->>A: 200 OK (received)
+  
+  Note over A,U: Success Response
+  A->>U: Return success (JSON)
+  A->>U: Send confirmation email
+  A->>S: Archive PDF to S3 for audit trail
