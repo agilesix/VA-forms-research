@@ -10,11 +10,17 @@ Individual form analysis documents, including implementation details, code refer
 ### `/diagrams/`
 Mermaid diagrams and other visual representations of form processing flows.
 
+### `/infrastructure/`
+Documentation of supporting infrastructure and systems that enable form processing.
+
 ## Available Research
 
 ### Form 21-2680
 - **[Implementation Overview](forms/21-2680-implementation-overview.md)** - Comprehensive analysis of how Form 21-2680 (Examination for Housebound Status or Permanent Need for Regular Aid and Attendance) is implemented
 - **[Processing Flow Diagram](diagrams/21-2680-flow.mermaid)** - Sequence diagram showing the end-to-end upload and processing flow
+
+### Infrastructure Documentation
+- **[Lighthouse Benefits Intake API and Central Mail Portal](infrastructure/lighthouse-benefits-intake-and-central-mail-portal.md)** - Complete technical analysis of the VA's document processing infrastructure, including API architecture, integration patterns, and operational details
 
 ## Contributing
 
@@ -34,3 +40,4 @@ When adding new form research:
 - Email notifications and confirmations
 - S3 archival and audit trails
 - Integration with existing VA.gov applications (e.g., pensions, disability)
+- Infrastructure and supporting systems
