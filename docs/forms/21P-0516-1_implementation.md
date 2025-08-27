@@ -100,43 +100,63 @@ src/applications/simple-forms/form-upload/
 
 ### 1. API Endpoints
 
-**Primary Controller**: `modules/simple_forms_api/app/controllers/simple_forms_api/v1/uploads_controller.rb`
+**Primary Controller**: `modules/simple_forms_api/app/controllers/simple_forms_api/v1/scanned_form_uploads_controller.rb`
+
+#### API Routes Configuration:
+```ruby
+# modules/simple_forms_api/config/routes.rb
+namespace :v1, defaults: { format: 'json' } do
+  # Different controller - handles structured forms
+  post '/simple_forms', to: 'uploads#submit'
+  
+  # CORRECT controller for form upload tool - handles scanned PDFs
+  post '/submit_scanned_form', to: 'scanned_form_uploads#submit'
+  post '/scanned_form_upload', to: 'scanned_form_uploads#upload_scanned_form'
+end
+```
+
+#### Frontend Configuration:
+```javascript
+// Frontend submits to this endpoint
+submitUrl: `${environment.API_URL}/simple_forms_api/v1/submit_scanned_form`
+```
 
 #### Key Methods:
-- `submit` - Main form submission endpoint
-- `submit_supporting_documents` - For additional document uploads
-- `get_intents_to_file` - For intent-based submissions (21-0966)
+- `submit` - Main form submission endpoint for scanned form uploads
+- `upload_scanned_form` - File upload endpoint for scanned forms
 
-### 2. Form Processing Pipeline
+**Important**: The form upload tool uses `scanned_form_uploads_controller.rb`, NOT `uploads_controller.rb`. The latter handles different form submission patterns.
+
+### 2. Scanned Form Processing Pipeline
+
+**Flow Overview**: Unlike structured forms that go through `uploads_controller.rb`, the form upload tool uses a different pattern specifically designed for scanned PDF submissions.
 
 ```mermaid
 sequenceDiagram
     participant User
     participant Frontend
-    participant UploadsController
+    participant ScannedFormUploadsController
     participant BenefitsIntake
     participant VBMS
     participant NotificationSystem
     participant StatusJob
 
     User->>Frontend: Upload form 21P-0516-1
-    Frontend->>UploadsController: POST /simple_forms_api/v1/uploads/submit
+    Frontend->>ScannedFormUploadsController: POST /simple_forms_api/v1/submit_scanned_form
     
-    UploadsController->>UploadsController: validate_form_data()
-    UploadsController->>UploadsController: create_form_submission()
-    UploadsController->>UploadsController: generate_pdf()
-    UploadsController->>BenefitsIntake: request_upload_location()
-    BenefitsIntake-->>UploadsController: location + UUID
+    ScannedFormUploadsController->>ScannedFormUploadsController: validate_metadata()
+    ScannedFormUploadsController->>ScannedFormUploadsController: create_form_submission()
+    ScannedFormUploadsController->>ScannedFormUploadsController: stamp_pdf()
+    ScannedFormUploadsController->>BenefitsIntake: request_upload_location()
+    BenefitsIntake-->>ScannedFormUploadsController: location + UUID
     
-    UploadsController->>UploadsController: stamp_pdf_with_uuid()
-    UploadsController->>UploadsController: create_form_submission_attempt()
-    UploadsController->>BenefitsIntake: perform_upload(pdf, metadata)
-    BenefitsIntake-->>UploadsController: upload_response
+    ScannedFormUploadsController->>ScannedFormUploadsController: create_form_submission_attempt()
+    ScannedFormUploadsController->>BenefitsIntake: perform_upload(pdf, metadata)
+    BenefitsIntake-->>ScannedFormUploadsController: upload_response
     
     alt Upload Successful (200)
-        UploadsController->>NotificationSystem: send_confirmation_email()
-        UploadsController->>UploadsController: upload_pdf_to_s3()
-        UploadsController-->>Frontend: {confirmation_number, status: 200}
+        ScannedFormUploadsController->>NotificationSystem: send_confirmation_email()
+        ScannedFormUploadsController-->>Frontend: {confirmation_number, status: 200}
         Frontend-->>User: Success confirmation
         
         loop Every batch cycle
@@ -150,54 +170,75 @@ sequenceDiagram
             end
         end
     else Upload Failed
-        UploadsController-->>Frontend: {error, status: 4xx/5xx}
+        ScannedFormUploadsController-->>Frontend: {error, status: 4xx/5xx}
         Frontend-->>User: Error message
     end
 ```
 
-### 3. Form Submission Processing
+### 3. Scanned Form Submission Processing
 
-#### Form Class Instantiation
+**Key Difference**: The scanned form upload controller handles pre-filled PDFs differently than structured form data.
+
+#### Metadata Creation (ScannedFormUploadsController)
 ```ruby
-# Pattern: "SimpleFormsApi::#{form_id.titleize.gsub(' ', '')}"
-# For 21P-0516-1: "SimpleFormsApi::Vba21p05161"
-form = "SimpleFormsApi::#{cleaned_form_number}".constantize.new(parsed_form_data)
+def validated_metadata
+  raw_metadata = {
+    'veteranFirstName' => params.dig(:form_data, :full_name, :first),
+    'veteranLastName' => params.dig(:form_data, :full_name, :last),
+    'fileNumber' => params.dig(:form_data, :id_number, :ssn) || 
+                    params.dig(:form_data, :id_number, :va_file_number),
+    'zipCode' => params.dig(:form_data, :postal_code),
+    'source' => 'VA Platform Digital Forms',
+    'docType' => params[:form_number],
+    'businessLine' => 'CMP'
+  }
+  SimpleFormsApiSubmission::MetadataValidator.validate(raw_metadata)
+end
 ```
 
-#### PDF Generation
+#### PDF Stamping
 ```ruby
-filler = SimpleFormsApi::PdfFiller.new(form_number: form_id, form: form)
-file_path = filler.generate(@current_user.loa[:current]) # Or generate() if unauthenticated
+stamper = PdfStamper.new(stamped_template_path: file_path, 
+                        current_loa: @current_user.loa[:current],
+                        timestamp: Time.current)
+stamper.stamp_pdf
 ```
 
-#### Metadata Validation
+#### Form Submission Creation
 ```ruby
-metadata = SimpleFormsApiSubmission::MetadataValidator.validate(
-  form.metadata,
-  zip_code_is_us_based: form.zip_code_is_us_based
+FormSubmission.create(
+  form_type: params[:form_number],
+  form_data: params[:form_data].to_json,
+  user_account: @current_user&.user_account
 )
 ```
 
-### 4. Benefits Intake Integration
+### 4. Benefits Intake Integration (Scanned Forms)
 
 #### Upload Request Flow
 ```ruby
-# 1. Request upload location from Lighthouse
-location, uuid = lighthouse_service.request_upload
+# 1. Prepare for upload - get location and UUID
+def prepare_for_upload
+  location, uuid = lighthouse_service.request_upload
+  create_form_submission_attempt(uuid)
+  [location, uuid]
+end
 
-# 2. Stamp PDF with UUID for tracking
-pdf_stamper = SimpleFormsApi::PdfStamper.new(
-  stamped_template_path: file_path, 
-  form: form
-)
-pdf_stamper.stamp_uuid(uuid)
+# 2. Log upload details with Datadog tracing  
+def log_upload_details(location, uuid)
+  Datadog::Tracing.active_trace&.set_tag('uuid', uuid)
+  Rails.logger.info('Simple forms api - preparing to upload scanned PDF to benefits intake', 
+                    { location: location, uuid: uuid })
+end
 
 # 3. Perform upload with metadata
-response = lighthouse_service.perform_upload(
-  metadata: metadata.to_json,
-  document: file_path,
-  upload_url: location
-)
+def perform_pdf_upload(location, file_path, metadata)
+  lighthouse_service.perform_upload(
+    metadata: metadata.to_json,
+    document: file_path,
+    upload_url: location
+  )
+end
 ```
 
 ## Monitoring & Alerting
@@ -568,11 +609,19 @@ end
 - **StatsD**: Metrics collection
 - **Rails Logger**: Application logging
 
+## Controller Architecture Clarification
+
+**Two Separate Form Processing Patterns**:
+1. **`uploads_controller.rb`** - Handles structured form submissions via `/simple_forms` endpoint
+2. **`scanned_form_uploads_controller.rb`** - Handles pre-filled PDF uploads via `/submit_scanned_form` endpoint
+
+**Form 21P-0516-1 Flow**: Uses the scanned form upload pattern, where users upload completed PDFs rather than filling out forms online.
+
 ## Areas Not Fully Documented in Code
 
 ### 1. Unclear Implementation Details
 
-1. **Form 21P-0516-1 Specific Class**: Could not locate the specific `SimpleFormsApi::Vba21p05161` class implementation
+1. **Form 21P-0516-1 Specific Class**: Could not locate the specific form class implementation
 2. **Frontend Upload Components**: Specific upload page components were not accessible
 3. **Template IDs Configuration**: The actual template_ids.yml file content was not visible
 4. **Feature Flag Configuration**: Specific feature flag settings for form 21P-0516-1
