@@ -28,6 +28,7 @@ graph TB
         E[Simple Forms API v1]
         F[Uploads Controller]
         G[Scanned Form Uploads Controller]
+        H1[PersistentAttachment Storage]
     end
     
     subgraph "Background Processing"
@@ -50,16 +51,17 @@ graph TB
     end
     
     D --> E
-    E --> F
-    F --> K
+    E --> G
+    G --> H1
+    G --> K
     K --> L
     H --> I
     H --> J
     J --> M
-    F --> N
+    G --> N
     I --> O
     J --> P
-    F --> Q
+    G --> Q
 ```
 
 </div>
@@ -75,15 +77,21 @@ Based on the routes.jsx file, form 21P-0516-1 follows the standard simple forms 
 // Form 21P-0516-1 URL: /simple-forms-upload/21p-0516-1
 ```
 
-### 2. User Journey
+### 2. User Journey (Two-Step Process)
 
 1. **Navigation**: User navigates to `/simple-forms-upload/21p-0516-1`
 2. **Authentication**: System verifies user authentication (required for this form)
 3. **Form Information**: System displays form information and upload instructions
-4. **File Upload**: User selects and uploads their completed PDF form
-5. **Validation**: Frontend validates file type, size, and other constraints
-6. **Submission**: Frontend sends form data and file to backend API
-7. **Confirmation**: User receives confirmation with tracking number
+4. **Step 1 - File Upload**: 
+   - User selects their completed PDF form
+   - Frontend validates file type, size, and other constraints
+   - Frontend uploads file to `/scanned_form_upload` endpoint
+   - System returns `confirmation_code` (GUID)
+5. **Step 2 - Form Submission**:
+   - User fills out additional metadata (name, SSN, address, etc.)
+   - Frontend sends form data + `confirmation_code` to `/submit_scanned_form`
+   - System retrieves uploaded file, processes, and submits to Benefits Intake
+6. **Confirmation**: User receives success confirmation with tracking UUID
 
 ### 3. Frontend Components
 
@@ -117,13 +125,20 @@ end
 
 #### Frontend Configuration:
 ```javascript
-// Frontend submits to this endpoint
+// Step 1: File upload endpoint
+uploadUrl: `${environment.API_URL}/simple_forms_api/v1/scanned_form_upload`
+
+// Step 2: Form submission endpoint  
 submitUrl: `${environment.API_URL}/simple_forms_api/v1/submit_scanned_form`
 ```
 
-#### Key Methods:
-- `submit` - Main form submission endpoint for scanned form uploads
-- `upload_scanned_form` - File upload endpoint for scanned forms
+#### Key Methods (Actual Implementation):
+- `upload_scanned_form` - **Step 1**: Uploads PDF file, creates PersistentAttachment, returns confirmation_code
+- `submit` - **Step 2**: Processes form metadata + confirmation_code, submits to Benefits Intake
+
+**Two-Step Process**: 
+1. File upload → get confirmation_code  
+2. Form submission → get tracking UUID
 
 **Important**: The form upload tool uses `scanned_form_uploads_controller.rb`, NOT `uploads_controller.rb`. The latter handles different form submission patterns.
 
@@ -136,30 +151,43 @@ sequenceDiagram
     participant User
     participant Frontend
     participant ScannedFormUploadsController
+    participant PersistentAttachment
     participant BenefitsIntake
     participant VBMS
     participant NotificationSystem
     participant StatusJob
 
-    User->>Frontend: Upload form 21P-0516-1
-    Frontend->>ScannedFormUploadsController: POST /simple_forms_api/v1/submit_scanned_form
+    Note over User,StatusJob: Two-Step Upload Process
     
-    ScannedFormUploadsController->>ScannedFormUploadsController: validate_metadata()
-    ScannedFormUploadsController->>ScannedFormUploadsController: create_form_submission()
-    ScannedFormUploadsController->>ScannedFormUploadsController: stamp_pdf()
-    ScannedFormUploadsController->>BenefitsIntake: request_upload_location()
+    User->>Frontend: 1. Select PDF file for form 21P-0516-1
+    Frontend->>ScannedFormUploadsController: POST /scanned_form_upload (file)
+    ScannedFormUploadsController->>PersistentAttachment: create VAForm attachment
+    PersistentAttachment-->>ScannedFormUploadsController: confirmation_code (GUID)
+    ScannedFormUploadsController-->>Frontend: {confirmation_code}
+    
+    User->>Frontend: 2. Submit form metadata
+    Frontend->>ScannedFormUploadsController: POST /submit_scanned_form (form_data + confirmation_code)
+    
+    ScannedFormUploadsController->>ScannedFormUploadsController: check_for_changes()
+    ScannedFormUploadsController->>PersistentAttachment: find_attachment_path(confirmation_code)
+    PersistentAttachment-->>ScannedFormUploadsController: file_path
+    
+    ScannedFormUploadsController->>ScannedFormUploadsController: stamp_pdf(file_path)
+    ScannedFormUploadsController->>ScannedFormUploadsController: validated_metadata()
+    ScannedFormUploadsController->>ScannedFormUploadsController: prepare_for_upload()
+    ScannedFormUploadsController->>BenefitsIntake: request_upload()
     BenefitsIntake-->>ScannedFormUploadsController: location + UUID
     
-    ScannedFormUploadsController->>ScannedFormUploadsController: create_form_submission_attempt()
-    ScannedFormUploadsController->>BenefitsIntake: perform_upload(pdf, metadata)
+    ScannedFormUploadsController->>ScannedFormUploadsController: create_form_submission_attempt(uuid)
+    ScannedFormUploadsController->>BenefitsIntake: perform_upload(pdf, metadata, location)
     BenefitsIntake-->>ScannedFormUploadsController: upload_response
     
     alt Upload Successful (200)
         ScannedFormUploadsController->>NotificationSystem: send_confirmation_email()
-        ScannedFormUploadsController-->>Frontend: {confirmation_number, status: 200}
-        Frontend-->>User: Success confirmation
+        ScannedFormUploadsController-->>Frontend: {status: 200, confirmation_number: uuid}
+        Frontend-->>User: Success confirmation with tracking number
         
-        loop Every batch cycle
+        loop Every batch cycle (BenefitsIntakeStatusJob)
             StatusJob->>BenefitsIntake: bulk_status(uuid)
             BenefitsIntake-->>StatusJob: status_response
             alt Status: vbms
@@ -175,42 +203,73 @@ sequenceDiagram
     end
 ```
 
-### 3. Scanned Form Submission Processing
+### 3. Scanned Form Submission Processing (Actual Implementation)
 
-**Key Difference**: The scanned form upload controller handles pre-filled PDFs differently than structured form data.
+**Two-Step Process**: The controller implements a separation between file upload and form submission.
 
-#### Metadata Creation (ScannedFormUploadsController)
+#### Step 1: File Upload (`upload_scanned_form`)
 ```ruby
-def validated_metadata
-  raw_metadata = {
-    'veteranFirstName' => params.dig(:form_data, :full_name, :first),
-    'veteranLastName' => params.dig(:form_data, :full_name, :last),
-    'fileNumber' => params.dig(:form_data, :id_number, :ssn) || 
-                    params.dig(:form_data, :id_number, :va_file_number),
-    'zipCode' => params.dig(:form_data, :postal_code),
-    'source' => 'VA Platform Digital Forms',
-    'docType' => params[:form_number],
-    'businessLine' => 'CMP'
-  }
-  SimpleFormsApiSubmission::MetadataValidator.validate(raw_metadata)
+def upload_scanned_form
+  attachment = PersistentAttachments::VAForm.new
+  attachment.form_id = params['form_id']
+  attachment.file = params['file']
+  raise Common::Exceptions::ValidationErrors, attachment unless attachment.valid?
+
+  attachment.save
+  render json: PersistentAttachmentVAFormSerializer.new(attachment)
 end
 ```
 
-#### PDF Stamping
+#### Step 2: Form Submission (`submit`)
 ```ruby
-stamper = PdfStamper.new(stamped_template_path: file_path, 
-                        current_loa: @current_user.loa[:current],
-                        timestamp: Time.current)
-stamper.stamp_pdf
+def submit
+  Datadog::Tracing.active_trace&.set_tag('form_id', params[:form_number])
+  check_for_changes
+
+  status, confirmation_number = upload_response
+
+  send_confirmation_email(params, confirmation_number) if status == 200
+
+  render json: { status:, confirmation_number: }
+end
+```
+
+#### Core Upload Response Processing
+```ruby
+def upload_response
+  file_path = find_attachment_path(params[:confirmation_code])
+  stamper = PdfStamper.new(stamped_template_path: file_path, 
+                          current_loa: @current_user.loa[:current],
+                          timestamp: Time.current)
+  stamper.stamp_pdf
+  metadata = validated_metadata
+  status, confirmation_number = upload_pdf(file_path, metadata)
+  file_size = File.size(file_path).to_f / (2**20)
+
+  Rails.logger.info(
+    'Simple forms api - scanned form uploaded',
+    { form_number: params[:form_number], status:, confirmation_number:, file_size: }
+  )
+  [status, confirmation_number]
+end
+```
+
+#### PDF Retrieval
+```ruby
+def find_attachment_path(confirmation_code)
+  PersistentAttachment.find_by(guid: confirmation_code).to_pdf.to_s
+end
 ```
 
 #### Form Submission Creation
 ```ruby
-FormSubmission.create(
-  form_type: params[:form_number],
-  form_data: params[:form_data].to_json,
-  user_account: @current_user&.user_account
-)
+def create_form_submission
+  FormSubmission.create(
+    form_type: params[:form_number],
+    form_data: params[:form_data].to_json,
+    user_account: @current_user&.user_account
+  )
+end
 ```
 
 ### 4. Benefits Intake Integration (Scanned Forms)
@@ -615,7 +674,9 @@ end
 1. **`uploads_controller.rb`** - Handles structured form submissions via `/simple_forms` endpoint
 2. **`scanned_form_uploads_controller.rb`** - Handles pre-filled PDF uploads via `/submit_scanned_form` endpoint
 
-**Form 21P-0516-1 Flow**: Uses the scanned form upload pattern, where users upload completed PDFs rather than filling out forms online.
+**Form 21P-0516-1 Flow**: Uses the scanned form upload pattern with a two-step process:
+1. Upload PDF file → get confirmation_code (via `upload_scanned_form`)
+2. Submit form metadata + confirmation_code → get tracking UUID (via `submit`)
 
 ## Areas Not Fully Documented in Code
 
